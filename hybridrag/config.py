@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
 
 CORPUS_DIR = ROOT / "data" / "campus"
+# 由 prepare 从本地文档整理出的 Markdown，和示例制度一起灌库。
+PREPARED_DIR = ROOT / "data" / "prepared"
 INDEX_DIR = ROOT / "data" / "index"
 FAISS_PATH = INDEX_DIR / "vectors.faiss"
 # 雪花编号里的机器位。单机灌库用 1 即可，多进程同时写入时再分开。

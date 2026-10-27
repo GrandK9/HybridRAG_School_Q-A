@@ -22,6 +22,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from hybridrag.config import (
     CORPUS_DIR,
+    PREPARED_DIR,
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
@@ -160,27 +161,34 @@ def rerank_scores(query: str, documents: list[str]) -> list[float]:
 
 
 def load_corpus() -> list[Document]:
-    if not CORPUS_DIR.exists():
-        raise FileNotFoundError(f"找不到语料目录：{CORPUS_DIR}")
+    """读取示例制度和 prepare 生成的 Markdown。正文来源用相对路径，避免不同目录撞名。"""
     documents: list[Document] = []
-    for path in sorted(CORPUS_DIR.glob("*.md")):
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
+    for folder in (CORPUS_DIR, PREPARED_DIR):
+        if not folder.exists():
             continue
-        title = path.stem
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                title = stripped.lstrip("#").strip()
-                break
-        documents.append(
-            Document(
-                page_content=text,
-                metadata={"doc_id": path.stem, "title": title, "source": path.name},
+        for path in sorted(folder.rglob("*.md")):
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
+                continue
+            relative = path.relative_to(folder)
+            title = path.stem
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    title = stripped.lstrip("#").strip()
+                    break
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "doc_id": relative.with_suffix("").as_posix().replace("/", "-"),
+                        "title": title,
+                        "source": relative.as_posix(),
+                    },
+                )
             )
-        )
     if not documents:
-        raise FileNotFoundError(f"{CORPUS_DIR} 里没有 markdown 文档")
+        raise FileNotFoundError(f"{CORPUS_DIR} 和 {PREPARED_DIR} 里都没有 markdown 文档")
     return documents
 
 
@@ -189,7 +197,7 @@ def split_documents(documents: list[Document], ids: Snowflake | None = None) -> 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=280,
         chunk_overlap=40,
-        separators=["\n## ", "\n### ", "\n\n", "\n", "。", "；", " "],
+        separators=["\n## ", "\n### ", "\n\n", "\n", "。", "；", " ", ""],
     )
     generator = ids or Snowflake(worker_id=VECTOR_ID_WORKER)
     chunks: list[Chunk] = []
@@ -213,7 +221,21 @@ def split_documents(documents: list[Document], ids: Snowflake | None = None) -> 
 
 
 def embed_documents(texts: list[str]) -> np.ndarray:
-    vectors = get_embeddings().embed_documents(texts)
+    """分批调用嵌入接口。某一批参数非法时，改成逐条提交，跳过单条也过不了的切片。"""
+    embeddings = get_embeddings()
+    vectors: list[list[float]] = []
+    batch_size = 16
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        try:
+            vectors.extend(embeddings.embed_documents(batch))
+        except Exception:
+            for text in batch:
+                try:
+                    vectors.extend(embeddings.embed_documents([text]))
+                except Exception as exc:
+                    preview = text.replace("\n", " ")[:40]
+                    raise RuntimeError(f"嵌入失败，切片长度 {len(text)}，开头是「{preview}」：{exc}") from exc
     array = np.ascontiguousarray(np.array(vectors, dtype="float32"))
     import faiss
 
@@ -289,11 +311,10 @@ def sync_elasticsearch(client: Elasticsearch, chunks: list[Chunk]) -> str:
     return "ik" if use_ik else "standard"
 
 
-def save_vector_index(chunks: list[Chunk]) -> None:
+def save_vector_index(chunks: list[Chunk], vectors: np.ndarray) -> None:
     import faiss
 
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    vectors = embed_documents([chunk.content for chunk in chunks])
     # IndexIDMap2 把调用方给出的 int64 和向量存在同一个文件里，查询直接返回该编号。
     base = faiss.IndexFlatIP(vectors.shape[1])
     index = faiss.IndexIDMap2(base)
@@ -311,8 +332,9 @@ def ingest(preload_reranker: bool = True) -> dict:
     if client is None:
         raise RuntimeError(f"Elasticsearch 未连接（{ES_URL}），正文无法入库")
     print(f"文档 {len(documents)} 篇，切片 {len(chunks)} 条，远程向量化（{EMBEDDING_MODEL}）")
+    vectors = embed_documents([chunk.content for chunk in chunks])
     analyzer = sync_elasticsearch(client, chunks)
-    save_vector_index(chunks)
+    save_vector_index(chunks, vectors)
     print(f"已写入 Elasticsearch 索引 {ES_INDEX}，分词：{analyzer}")
     if preload_reranker:
         print(f"重排接口：{RERANKER_MODEL}")

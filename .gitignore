@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 .env
 data/index/
+# Public teaching documents downloaded for local experiments. Keep them off the remote.
+data/local-dataset/
+# Markdown produced from data/local-dataset by hybridrag.prepare. Regenerated locally.
+data/prepared/
 .gradio/
 .pytest_cache/
 *.log

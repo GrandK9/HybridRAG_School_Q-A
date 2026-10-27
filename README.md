@@ -47,11 +47,14 @@ Elasticsearch 使用本机已有容器，索引与其他项目的索引分开：
 docker start shumamall-es
 cd D:\build-my-project\projects\HybridRAG_School_Q&A
 .\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python -m hybridrag.prepare data/local-dataset -o data/prepared
 .\.venv\Scripts\python -m hybridrag.ingest
 .\.venv\Scripts\python app.py
 ```
 
 浏览器打开 http://127.0.0.1:7860 。
+
+`prepare` 读取 pdf、doc、docx、txt 和 zip。rar 需要本机的 7-Zip，没有时会写进 `data/prepared/skipped.txt`。
 
 密钥和模型名写在 `.env`，模板见 `.env.example`。`EMBEDDING_API_KEY` 用于硅基流动的嵌入和重排，`DEEPSEEK_API_KEY` 用于生成。生成密钥留空时，页面只返回检索到的原文。索引已经建好时，可以跳过 `ingest`。
 
@@ -62,8 +65,9 @@ data/campus/          示例制度
 hybridrag/config.py   读取 .env，并写明召回条数等固定参数
 hybridrag/snowflake.py 切片入库时的雪花编号
 hybridrag/fusion.py   RRF
+hybridrag/prepare.py  把 pdf、doc、docx、txt、zip 整理成 Markdown
 hybridrag/pipeline.py 切片、灌库、四种检索、生成
 app.py                问答页
 ```
 
-`data/index/` 中的向量文件由灌库生成，不提交。
+`data/local-dataset/` 是下载的原始文件，`data/prepared/` 是整理出的 Markdown，`data/index/` 是向量文件。这三处都只留在本地。

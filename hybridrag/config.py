@@ -13,7 +13,8 @@ load_dotenv(ROOT / ".env")
 CORPUS_DIR = ROOT / "data" / "campus"
 INDEX_DIR = ROOT / "data" / "index"
 FAISS_PATH = INDEX_DIR / "vectors.faiss"
-CHUNKS_PATH = INDEX_DIR / "chunks.json"
+# 雪花编号里的机器位。单机灌库用 1 即可，多进程同时写入时再分开。
+VECTOR_ID_WORKER = int(os.getenv("VECTOR_ID_WORKER", "1"))
 
 ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 ES_INDEX = os.getenv("ES_INDEX", "campus_chunks")
@@ -29,7 +30,7 @@ QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 
 # 每一路先多召回一些，融合和重排才有选择空间。最终给生成模型的是 TOP_N 条。
 RECALL_K = 20

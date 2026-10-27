@@ -12,7 +12,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-import jieba
 import numpy as np
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
@@ -20,10 +19,8 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from rank_bm25 import BM25Okapi
 
 from hybridrag.config import (
-    CHUNKS_PATH,
     CORPUS_DIR,
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
@@ -41,8 +38,10 @@ from hybridrag.config import (
     RRF_K,
     STRATEGIES,
     TOP_N,
+    VECTOR_ID_WORKER,
 )
 from hybridrag.fusion import reciprocal_rank_fusion
+from hybridrag.snowflake import Snowflake
 
 SYSTEM_PROMPT = """你是示范大学的校园制度问答助手。
 只能根据给定资料回答，不要使用资料以外的数字、日期或部门名称。
@@ -52,6 +51,7 @@ SYSTEM_PROMPT = """你是示范大学的校园制度问答助手。
 
 @dataclass
 class Chunk:
+    vector_id: int
     chunk_id: str
     doc_id: str
     title: str
@@ -60,6 +60,7 @@ class Chunk:
 
     def to_dict(self) -> dict:
         return {
+            "vector_id": self.vector_id,
             "chunk_id": self.chunk_id,
             "doc_id": self.doc_id,
             "title": self.title,
@@ -68,18 +69,21 @@ class Chunk:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Chunk":
+    def from_source(cls, source: dict, vector_id: int) -> "Chunk":
+        # 以 ES 的 _id 为准。JSON 数字超过 2^53 时有的客户端会丢掉低位，字符串 _id 不会。
         return cls(
-            chunk_id=data["chunk_id"],
-            doc_id=data["doc_id"],
-            title=data["title"],
-            source=data["source"],
-            content=data["content"],
+            vector_id=vector_id,
+            chunk_id=source["chunk_id"],
+            doc_id=source["doc_id"],
+            title=source["title"],
+            source=source["source"],
+            content=source["content"],
         )
 
 
 @dataclass
 class Hit:
+    vector_id: int
     chunk_id: str
     title: str
     source: str
@@ -180,13 +184,14 @@ def load_corpus() -> list[Document]:
     return documents
 
 
-def split_documents(documents: list[Document]) -> list[Chunk]:
+def split_documents(documents: list[Document], ids: Snowflake | None = None) -> list[Chunk]:
     # 中文制度文本按标题和句号切。块太长时，一个向量会混进多条规定，检索会漂。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=280,
         chunk_overlap=40,
         separators=["\n## ", "\n### ", "\n\n", "\n", "。", "；", " "],
     )
+    generator = ids or Snowflake(worker_id=VECTOR_ID_WORKER)
     chunks: list[Chunk] = []
     for document in documents:
         for index, piece in enumerate(splitter.split_documents([document])):
@@ -196,6 +201,7 @@ def split_documents(documents: list[Document]) -> list[Chunk]:
             meta = document.metadata
             chunks.append(
                 Chunk(
+                    vector_id=generator.next_id(),
                     chunk_id=f"{meta['doc_id']}-{index:03d}",
                     doc_id=meta["doc_id"],
                     title=meta["title"],
@@ -248,7 +254,7 @@ def ik_installed(client: Elasticsearch) -> bool:
 
 
 def sync_elasticsearch(client: Elasticsearch, chunks: list[Chunk]) -> str:
-    """用同一批切片重建索引。索引和向量行必须一一对应，否则融合会对错文档。"""
+    """按 vector_id 重建索引。正文只放在这里，向量检索命中后再按这个编号取回。"""
     use_ik = ik_installed(client)
     text_field = {"type": "text"}
     if use_ik:
@@ -264,6 +270,7 @@ def sync_elasticsearch(client: Elasticsearch, chunks: list[Chunk]) -> str:
         settings={"number_of_shards": 1, "number_of_replicas": 0},
         mappings={
             "properties": {
+                "vector_id": {"type": "long"},
                 "chunk_id": {"type": "keyword"},
                 "doc_id": {"type": "keyword"},
                 "title": text_field,
@@ -273,7 +280,7 @@ def sync_elasticsearch(client: Elasticsearch, chunks: list[Chunk]) -> str:
         },
     )
     actions = [
-        {"_index": ES_INDEX, "_id": chunk.chunk_id, "_source": chunk.to_dict()}
+        {"_index": ES_INDEX, "_id": str(chunk.vector_id), "_source": chunk.to_dict()}
         for chunk in chunks
     ]
     success, errors = bulk(client, actions, refresh="wait_for")
@@ -287,73 +294,50 @@ def save_vector_index(chunks: list[Chunk]) -> None:
 
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     vectors = embed_documents([chunk.content for chunk in chunks])
-    index = faiss.IndexFlatIP(vectors.shape[1])
-    index.add(vectors)
-    faiss.write_index(index, str(FAISS_PATH))
-    CHUNKS_PATH.write_text(
-        json.dumps([chunk.to_dict() for chunk in chunks], ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    # IndexIDMap2 把调用方给出的 int64 和向量存在同一个文件里，查询直接返回该编号。
+    base = faiss.IndexFlatIP(vectors.shape[1])
+    index = faiss.IndexIDMap2(base)
+    vector_ids = np.ascontiguousarray(
+        np.array([chunk.vector_id for chunk in chunks], dtype=np.int64)
     )
+    index.add_with_ids(vectors, vector_ids)
+    faiss.write_index(index, str(FAISS_PATH))
 
 
 def ingest(preload_reranker: bool = True) -> dict:
     documents = load_corpus()
     chunks = split_documents(documents)
-    print(f"文档 {len(documents)} 篇，切片 {len(chunks)} 条，远程向量化（{EMBEDDING_MODEL}）")
-    save_vector_index(chunks)
     client = connect_es()
-    analyzer = "未连接"
     if client is None:
-        print(f"Elasticsearch 未连接（{ES_URL}），BM25 将使用本地 jieba 分词")
-    else:
-        analyzer = sync_elasticsearch(client, chunks)
-        print(f"已写入 Elasticsearch 索引 {ES_INDEX}，分词：{analyzer}")
+        raise RuntimeError(f"Elasticsearch 未连接（{ES_URL}），正文无法入库")
+    print(f"文档 {len(documents)} 篇，切片 {len(chunks)} 条，远程向量化（{EMBEDDING_MODEL}）")
+    analyzer = sync_elasticsearch(client, chunks)
+    save_vector_index(chunks)
+    print(f"已写入 Elasticsearch 索引 {ES_INDEX}，分词：{analyzer}")
     if preload_reranker:
         print(f"重排接口：{RERANKER_MODEL}")
     return {"documents": len(documents), "chunks": len(chunks), "analyzer": analyzer}
 
 
-def _tokenize(text: str) -> list[str]:
-    return [token.strip() for token in jieba.cut(text) if token.strip()]
-
-
 class CampusQA:
     def __init__(self) -> None:
-        if not CHUNKS_PATH.exists() or not FAISS_PATH.exists():
-            raise FileNotFoundError("还没有索引。请先运行 python -m hybridrag.ingest")
+        if not FAISS_PATH.exists():
+            raise FileNotFoundError("还没有向量索引。请先运行 python -m hybridrag.ingest")
         import faiss
 
-        raw = json.loads(CHUNKS_PATH.read_text(encoding="utf-8"))
-        self.chunks = [Chunk.from_dict(item) for item in raw]
-        self.by_id = {chunk.chunk_id: chunk for chunk in self.chunks}
         self.faiss_index = faiss.read_index(str(FAISS_PATH))
-        if self.faiss_index.ntotal != len(self.chunks):
-            raise RuntimeError("FAISS 行数和切片数不一致，请重新执行 ingest")
-        tokenized = [_tokenize(f"{chunk.title} {chunk.content}") for chunk in self.chunks]
-        self._bm25 = BM25Okapi(tokenized)
+        if not isinstance(self.faiss_index, faiss.IndexIDMap2):
+            raise RuntimeError("向量索引没有身份编号，请重新执行 ingest")
         self.es = connect_es()
-        self.es_ok = False
-        self.analyzer = "local-jieba"
-        self.sparse_backend = "本地 BM25（jieba）。Elasticsearch 未连接"
-        if self.es is not None:
-            try:
-                self._ensure_es()
-                self.es_ok = True
-                kind = "IK" if self.analyzer == "ik" else "标准分词"
-                self.sparse_backend = f"Elasticsearch BM25（{kind}）"
-            except Exception as exc:
-                self.es_ok = False
-                self.sparse_backend = f"本地 BM25（jieba）。同步 ES 失败：{exc}"
-
-    def _ensure_es(self) -> None:
-        """启动时如果 ES 是空的，用已保存的切片补上，避免向量和关键词不是同一批文档。"""
-        exists = self.es.indices.exists(index=ES_INDEX)
-        count = 0
-        if exists:
-            count = self.es.count(index=ES_INDEX)["count"]
-            self.analyzer = "ik" if ik_installed(self.es) else "standard"
-        if (not exists) or count != len(self.chunks):
-            self.analyzer = sync_elasticsearch(self.es, self.chunks)
+        if self.es is None:
+            raise RuntimeError(f"Elasticsearch 未连接：{ES_URL}")
+        if not self.es.indices.exists(index=ES_INDEX):
+            raise RuntimeError(f"Elasticsearch 中没有索引 {ES_INDEX}，请先执行 ingest")
+        count = self.es.count(index=ES_INDEX)["count"]
+        if count != self.faiss_index.ntotal:
+            raise RuntimeError("ES 文档数和 FAISS 向量数不一致，请重新执行 ingest")
+        kind = "IK" if ik_installed(self.es) else "标准分词"
+        self.sparse_backend = f"Elasticsearch BM25（{kind}）"
 
     def search(self, query: str, strategy: str, top_n: int = TOP_N) -> list[Hit]:
         query = query.strip()
@@ -405,23 +389,23 @@ class CampusQA:
         )
 
     def _search_vector(self, query: str, top_k: int) -> list[Hit]:
-        scores, indices = self.faiss_index.search(embed_query(query), top_k)
+        scores, vector_ids = self.faiss_index.search(embed_query(query), top_k)
+        ordered = [
+            (int(vector_id), float(score))
+            for score, vector_id in zip(scores[0], vector_ids[0])
+            if int(vector_id) >= 0
+        ]
+        chunks = self._load_chunks([vector_id for vector_id, _ in ordered])
         hits: list[Hit] = []
-        for rank, (score, index) in enumerate(zip(scores[0], indices[0]), start=1):
-            if index < 0:
+        for rank, (vector_id, score) in enumerate(ordered, start=1):
+            chunk = chunks.get(vector_id)
+            if chunk is None:
                 continue
-            chunk = self.chunks[int(index)]
-            hits.append(self._hit(chunk, float(score), rank))
+            hits.append(self._hit(chunk, score, rank))
         return hits
 
     def _search_bm25(self, query: str, top_k: int) -> list[Hit]:
-        if self.es_ok:
-            try:
-                return self._search_es(query, top_k)
-            except Exception:
-                self.es_ok = False
-                self.sparse_backend = "本地 BM25（jieba）。Elasticsearch 查询失败，已降级"
-        return self._search_local_bm25(query, top_k)
+        return self._search_es(query, top_k)
 
     def _search_es(self, query: str, top_k: int) -> list[Hit]:
         response = self.es.search(
@@ -437,42 +421,43 @@ class CampusQA:
         )
         hits: list[Hit] = []
         for rank, item in enumerate(response["hits"]["hits"], start=1):
-            chunk = self.by_id.get(item["_id"])
-            if chunk is None:
-                source = item["_source"]
-                chunk = Chunk.from_dict(source)
+            chunk = self._chunk_from_hit(item)
             hits.append(self._hit(chunk, float(item["_score"]), rank))
         return hits
 
-    def _search_local_bm25(self, query: str, top_k: int) -> list[Hit]:
-        scores = self._bm25.get_scores(_tokenize(query))
-        order = np.argsort(scores)[::-1][:top_k]
-        hits: list[Hit] = []
-        rank = 1
-        for index in order:
-            score = float(scores[int(index)])
-            if score <= 0:
+    def _load_chunks(self, vector_ids: list[int]) -> dict[int, Chunk]:
+        if not vector_ids:
+            return {}
+        response = self.es.mget(index=ES_INDEX, ids=[str(vector_id) for vector_id in vector_ids])
+        loaded: dict[int, Chunk] = {}
+        for doc in response["docs"]:
+            if not doc.get("found"):
                 continue
-            hits.append(self._hit(self.chunks[int(index)], score, rank))
-            rank += 1
-        return hits
+            vector_id = int(doc["_id"])
+            loaded[vector_id] = Chunk.from_source(doc["_source"], vector_id)
+        return loaded
+
+    @staticmethod
+    def _chunk_from_hit(item: dict) -> Chunk:
+        return Chunk.from_source(item["_source"], int(item["_id"]))
 
     def _fuse(self, query: str, recall_k: int) -> list[Hit]:
         vector_hits = self._search_vector(query, recall_k)
         bm25_hits = self._search_bm25(query, recall_k)
         fused = reciprocal_rank_fusion(
             [
-                [hit.chunk_id for hit in vector_hits],
-                [hit.chunk_id for hit in bm25_hits],
+                [str(hit.vector_id) for hit in vector_hits],
+                [str(hit.vector_id) for hit in bm25_hits],
             ],
             k=RRF_K,
         )
-        recalled = {hit.chunk_id for hit in vector_hits + bm25_hits}
+        lookup = {str(hit.vector_id): hit for hit in vector_hits + bm25_hits}
         hits: list[Hit] = []
-        for rank, (chunk_id, score) in enumerate(fused, start=1):
-            if chunk_id not in recalled or chunk_id not in self.by_id:
+        for rank, (vector_id, score) in enumerate(fused, start=1):
+            found = lookup.get(vector_id)
+            if found is None:
                 continue
-            hits.append(self._hit(self.by_id[chunk_id], score, rank))
+            hits.append(self._copy_hit(found, score, rank))
         return hits
 
     def _rerank(self, query: str, candidates: list[Hit], top_n: int) -> list[Hit]:
@@ -480,11 +465,10 @@ class CampusQA:
             return []
         scores = rerank_scores(query, [hit.content for hit in candidates])
         order = np.argsort(np.array(scores))[::-1][:top_n]
-        hits: list[Hit] = []
-        for rank, index in enumerate(order, start=1):
-            chunk = self.by_id[candidates[int(index)].chunk_id]
-            hits.append(self._hit(chunk, float(scores[int(index)]), rank))
-        return hits
+        return [
+            self._copy_hit(candidates[int(index)], float(scores[int(index)]), rank)
+            for rank, index in enumerate(order, start=1)
+        ]
 
     def _generate(self, query: str, hits: list[Hit]) -> str:
         from langchain_openai import ChatOpenAI
@@ -511,10 +495,23 @@ class CampusQA:
     @staticmethod
     def _hit(chunk: Chunk, score: float, rank: int) -> Hit:
         return Hit(
+            vector_id=chunk.vector_id,
             chunk_id=chunk.chunk_id,
             title=chunk.title,
             source=chunk.source,
             content=chunk.content,
+            score=score,
+            rank=rank,
+        )
+
+    @staticmethod
+    def _copy_hit(hit: Hit, score: float, rank: int) -> Hit:
+        return Hit(
+            vector_id=hit.vector_id,
+            chunk_id=hit.chunk_id,
+            title=hit.title,
+            source=hit.source,
+            content=hit.content,
             score=score,
             rank=rank,
         )

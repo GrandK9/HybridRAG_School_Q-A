@@ -22,13 +22,13 @@
 
 ## 当前实现
 
-一条切片有两个去处。正文写入 Elasticsearch 索引 `campus_chunks`，用 IK 做中文分词，供 BM25 使用。同一段正文经硅基流动的 `BAAI/bge-large-zh-v1.5` 变成 1024 维向量，写入本地 FAISS 文件。FAISS 只保存向量矩阵并返回行号，行号通过切片编号对应到 ES 里的正文。
+一条切片在入库时得到一个雪花 `vector_id`。正文和这个编号写入 Elasticsearch 索引 `campus_chunks`，用 IK 做中文分词，供 BM25 使用。同一段正文经硅基流动的 `BAAI/bge-large-zh-v1.5` 变成 1024 维向量，和同一个 `vector_id` 一起写入 FAISS。向量检索返回编号，再按编号向 ES 取正文。
 
 提问时按页面所选策略检索：
 
 | 策略 | 做法 |
 | --- | --- |
-| 纯向量 | 问题向量与 FAISS 中每一行做内积，取最相近的切片 |
+| 纯向量 | FAISS 按内积返回 `vector_id`，再向 ES 取对应正文 |
 | 纯 BM25 | Elasticsearch 关键词检索 |
 | 混合 | 两路各召回 20 条，在应用层用 RRF（k=60）按名次融合 |
 | 混合 + 重排 | 在融合结果上调用硅基流动 `BAAI/bge-reranker-v2-m3`，重排后取前 5 条 |
@@ -60,9 +60,10 @@ cd D:\build-my-project\projects\HybridRAG_School_Q&A
 ```
 data/campus/          示例制度
 hybridrag/config.py   读取 .env，并写明召回条数等固定参数
+hybridrag/snowflake.py 切片入库时的雪花编号
 hybridrag/fusion.py   RRF
 hybridrag/pipeline.py 切片、灌库、四种检索、生成
 app.py                问答页
 ```
 
-`data/index/` 中的向量文件和切片缓存由灌库生成，不提交。
+`data/index/` 中的向量文件由灌库生成，不提交。
